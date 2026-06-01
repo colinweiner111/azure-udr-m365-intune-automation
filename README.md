@@ -49,8 +49,8 @@ The full list of IPs per category is published at [Microsoft 365 URLs and IP add
 
 - Azure subscription with permission to create resources and assign RBAC roles
 - Azure CLI installed, or use [Azure Cloud Shell](https://shell.azure.com) (no local install required)
-- The deployment resource group must exist before running Bicep (Bicep provisions the first route table in that RG automatically)
-- Route tables in **other** resource groups (referenced as `resourcegroup/tablename` in `routeTableNames`) must already exist — Bicep does not create them and does not touch resources in other RGs
+- The deployment resource group must exist before running `deploy.ps1`
+- Route tables do **not** need to be pre-created — `deploy.ps1` creates any missing ones automatically across all resource groups listed in `routeTableNames`. The resource groups themselves must exist.
 
 ### Azure RBAC Requirements
 
@@ -94,8 +94,8 @@ done
 |------|-------|---------|
 | **Network Contributor** | Resource Group | Read and update Route Tables (add/remove UDR entries) |
 | **Storage Blob Data Contributor** | Storage Account | Read/write route-state blobs, run-log blobs, and the deployment package |
-
-> **Note:** Storage Queue Data Contributor and Storage Table Data Contributor are **not** assigned. Per Microsoft's Flex Consumption documentation, those roles are only required for blob-triggered or event hub-triggered functions — not timer-triggered functions.
+| **Storage Queue Data Contributor** | Storage Account | Supports Functions host storage interactions in Flex Consumption |
+| **Storage Table Data Contributor** | Storage Account | Supports Functions host storage interactions in Flex Consumption |
 
 To verify role assignments after deployment:
 
@@ -117,7 +117,21 @@ az role assignment list \
 
 ## Deploy
 
-> **Everything below can be run entirely from [Azure Cloud Shell](https://shell.azure.com)** — no local tooling required. Cloud Shell has the Azure CLI, `pip`, and `git` pre-installed and you're already authenticated.
+> **Recommended: use `deploy.ps1`** — a single PowerShell script that runs the full sequence automatically. The manual steps below are provided for reference or for environments where the script can't be used (e.g. Azure Cloud Shell without PowerShell 7).
+
+### Using deploy.ps1 (recommended)
+
+`deploy.ps1` handles the complete deployment in one command — including creating any missing route tables across all resource groups. Run `Get-Help .\deploy.ps1` for full usage.
+
+```powershell
+.\deploy.ps1 `
+    -ParametersFile infra/main.testing.parameters.json `
+    -ResourceGroup rg-udr-m365-automation-testing
+```
+
+---
+
+### Manual steps
 
 ### 1. Clone the repo and set your subscription
 
@@ -140,6 +154,7 @@ For separate environments, use dedicated parameter files:
 ```bash
 code infra/main.testing.parameters.json
 code infra/main.prod.parameters.json
+code infra/main.customer.parameters.template.json
 ```
 
 Use different values per environment for at least:
@@ -150,6 +165,8 @@ Use different values per environment for at least:
 - deployment resource group
 
 This keeps test and production state/log data isolated.
+
+For customer deployments, copy `infra/main.customer.parameters.template.json` to a customer-specific parameters file and fill in the customer subscription, region, function app name, storage account name, and all route tables.
 
 | Parameter | Description | Required |
 |-----------|-------------|----------|
@@ -182,6 +199,8 @@ az deployment group create \
 
 Bicep creates: Storage Account, Blob containers, Flex Consumption Function App (Python 3.11, FC1) with System-Assigned Managed Identity, Application Insights, and all required RBAC role assignments (Network Contributor on the RG, Storage Blob/Queue/Table Data Contributor on the storage account).
 
+For customer deployments with route tables in multiple resource groups, treat Network Contributor on every resource group listed in `routeTableNames` as mandatory for first-run success.
+
 ### 3a. Assign Network Contributor on additional resource groups
 
 Skip this step if all your route tables are in the deployment resource group.
@@ -203,7 +222,9 @@ for RG in rg-dept01 rg-dept02 rg-dept03; do
 done
 ```
 
-> **Note:** The route tables in those RGs must already exist — this step only grants the managed identity permission to manage routes on them. The function does not create route tables.
+> **Note:** If using `deploy.ps1`, this step and the route table creation are handled automatically. The manual steps here are for reference only.
+
+> **Important:** RBAC assignment propagation is not immediate. Wait at least 5 minutes before the first manual trigger or validation run.
 
 ### 4. Deploy function code
 
@@ -230,6 +251,8 @@ az functionapp show --resource-group <resource-group> --name <function-app-name>
 
 az webapp log tail --resource-group <resource-group> --name <function-app-name>
 ```
+
+For a customer handoff, run one manual trigger after deployment and inspect the newest blob in the `run-logs` container. Do not treat the deployment as complete until every table in the run-log shows an empty `errors` array.
 
 The function runs automatically at 1:00 PM UTC daily (`0 0 13 * * *`), which is 6:00 AM PDT.
 

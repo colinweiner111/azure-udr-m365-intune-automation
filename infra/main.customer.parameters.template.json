@@ -1,0 +1,33 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "subscriptionId": {
+      "value": "<customer-subscription-id>"
+    },
+    "location": {
+      "value": "<azure-region>"
+    },
+    "functionAppName": {
+      "value": "<customer-function-app-name>"
+    },
+    "storageAccountName": {
+      "value": "<customerstorageacct>"
+    },
+    "containerName": {
+      "value": "m365-routes"
+    },
+    "routeTableNames": {
+      "value": "<deployment-rg-route-table>,<other-rg>/<other-route-table>"
+    },
+    "nextHopType": {
+      "value": "Internet"
+    },
+    "nextHopIp": {
+      "value": ""
+    },
+    "m365Categories": {
+      "value": "Optimize,Allow"
+    }
+  }
+}
