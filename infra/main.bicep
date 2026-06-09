@@ -32,15 +32,6 @@ param m365Categories string = 'Optimize,Allow'
 @description('NCRONTAB schedule for the timer trigger in UTC (six fields: sec min hour day month day-of-week).')
 param m365RouteSyncSchedule string = '0 0 0 * * *'
 
-// Route Table for M365 UDRs
-resource routeTable 'Microsoft.Network/routeTables@2023-09-01' = {
-  name: split(routeTableNames, ',')[0]
-  location: location
-  properties: {
-    disableBgpRoutePropagation: false
-  }
-}
-
 // Application Insights
 resource appInsights 'Microsoft.Insights/components@2020-02-02' = {
   name: '${functionAppName}-insights'

@@ -14,14 +14,19 @@ Keeps Azure Route Tables synchronized with Microsoft 365 IP ranges so M365 traff
 - [Prerequisites](#prerequisites)
   - [Azure RBAC Requirements](#azure-rbac-requirements)
 - [Deploy](#deploy)
+  - [Using deploy.ps1 (recommended)](#using-deployps1-recommended)
+  - [Manual steps](#manual-steps)
   - [1. Clone the repo and set your subscription](#1-clone-the-repo-and-set-your-subscription)
   - [2. Configure parameters](#2-configure-parameters)
   - [3. Provision infrastructure](#3-provision-infrastructure)
+  - [3a. Assign Network Contributor on additional resource groups](#3a-assign-network-contributor-on-additional-resource-groups)
   - [4. Deploy function code](#4-deploy-function-code)
   - [5. Verify](#5-verify)
+- [Schedule configuration](#schedule-configuration)
 - [Trigger manually](#trigger-manually)
 - [Run logs](#run-logs)
 - [Troubleshooting](#troubleshooting)
+- [Customer onboarding](#customer-onboarding)
 - [References](#references)
 - [License](#license)
 
@@ -39,7 +44,7 @@ Microsoft classifies M365 network traffic into [three categories](https://learn.
 
 The full list of IPs per category is published at [Microsoft 365 URLs and IP address ranges](https://learn.microsoft.com/en-us/microsoft-365/enterprise/urls-and-ip-address-ranges?view=o365-worldwide).
 
-**Why not `Default`?** It is too broad and would bypass too much inspection. `Optimize` + `Allow` is the targeted set (about 34 routes as of April 2026).
+**Why not `Default`?** It is too broad and would bypass too much inspection. `Optimize` + `Allow` is the targeted set (about 34 routes, subject to change as Microsoft updates endpoints).
 
 **Why UDRs?** With a [forced tunnel](https://learn.microsoft.com/en-us/azure/vpn-gateway/vpn-gateway-forced-tunneling-rm), M365 can hairpin through your NVA/VPN and add latency. UDRs with `nextHopType: Internet` provide local breakout only for those M365 CIDRs.
 
@@ -73,22 +78,7 @@ If you manage route tables in additional resource groups (using `resourcegroup/t
 
 > **Why:** The Function App uses a system-assigned managed identity. This identity is created inside the function app's resource group and has no automatic access to other resource groups. It is also tied to the function app's lifecycle — if you delete and recreate the function app (e.g. to fix a broken deployment), a new identity with a new principal ID is created and these cross-RG role assignments must be re-applied.
 
-```bash
-# Get the managed identity principal ID after Bicep deployment
-PRINCIPAL_ID=$(az functionapp show \
-  --resource-group <deployment-resource-group> \
-  --name <function-app-name> \
-  --query identity.principalId -o tsv)
-
-# Assign Network Contributor on each additional route table resource group
-for RG in rg-dept01 rg-dept02 rg-dept03; do
-  az role assignment create \
-    --assignee-object-id $PRINCIPAL_ID \
-    --assignee-principal-type ServicePrincipal \
-    --role "Network Contributor" \
-    --scope "/subscriptions/<subscription-id>/resourceGroups/$RG"
-done
-```
+See [3a. Assign Network Contributor on additional resource groups](#3a-assign-network-contributor-on-additional-resource-groups) for the exact command.
 
 | Role | Scope | Purpose |
 |------|-------|---------|
@@ -136,7 +126,7 @@ az role assignment list \
 
 ### Manual steps
 
-### 1. Clone the repo and set your subscription
+#### 1. Clone the repo and set your subscription
 
 ```bash
 git clone https://github.com/colinweiner111/azure-udr-m365-automation.git
@@ -144,7 +134,11 @@ cd azure-udr-m365-automation
 az account set --subscription <subscription-id>
 ```
 
-### 2. Configure parameters
+> **Caution:** The manual path depends on the currently selected Azure CLI context. Unlike `deploy.ps1`, it does not verify that your active subscription matches `subscriptionId` in the parameters file.
+
+> **Caution:** The manual path also does not auto-create route tables. Ensure every table listed in `routeTableNames` already exists before running the Bicep deployment.
+
+#### 2. Configure parameters
 
 Open the parameters file in the Cloud Shell editor:
 
@@ -171,23 +165,6 @@ This keeps test and production state/log data isolated.
 
 For customer deployments, copy `infra/main.customer.parameters.template.json` to a customer-specific parameters file and fill in the customer subscription, region, function app name, storage account name, and all route tables.
 
-### Customer onboarding (recommended)
-
-Use one Function App deployment per customer subscription.
-
-- Keep each customer isolated to one subscription and one Function App.
-- Use `ROUTE_TABLE_NAMES` only for route tables in that same subscription.
-- For tables in other resource groups, grant the Function App managed identity `Network Contributor` on each resource group.
-- Let customers update only operational app settings (for example `M365_ROUTE_SYNC_SCHEDULE` and `ROUTE_TABLE_NAMES`) in the portal.
-- Keep the customer parameters file in source control and update it after any portal-only change so future redeployments stay in sync.
-
-Customer handoff checklist:
-
-- Confirm route tables exist.
-- Confirm RBAC on every route-table resource group.
-- Run one manual trigger and verify the latest run-log has no table-level errors.
-- Confirm `M365_ROUTE_SYNC_SCHEDULE` is set to the agreed UTC schedule.
-
 | Parameter | Description | Required |
 |-----------|-------------|----------|
 | `subscriptionId` | Azure subscription ID | Yes |
@@ -201,9 +178,11 @@ Customer handoff checklist:
 | `m365Categories` | M365 categories to include: `Optimize`, `Allow`, `Default` | Default: `Optimize,Allow` |
 | `m365RouteSyncSchedule` | Timer schedule in UTC (NCRONTAB, 6 fields: `sec min hour day month day-of-week`) | Default: `0 0 0 * * *` |
 
-> **Route table limit:** Azure caps each route table at ~400 routes. `Optimize,Allow` produces ~34 routes as of April 2026 — well within limits.
+> **Parameter -> app setting mapping:** The Bicep deployment parameters map to Function App environment variables as follows: `routeTableNames` -> `ROUTE_TABLE_NAMES`, `containerName` -> `CONTAINER_NAME`, `m365Categories` -> `M365_CATEGORIES`, `m365RouteSyncSchedule` -> `M365_ROUTE_SYNC_SCHEDULE`.
 
-### 3. Provision infrastructure
+> **Route table limit:** Azure caps each route table at ~400 routes. `Optimize,Allow` is typically around ~34 routes, well within limits.
+
+#### 3. Provision infrastructure
 
 ```bash
 az group create --name <resource-group> --location <location>
@@ -222,7 +201,7 @@ Bicep creates: Storage Account, Blob containers, Flex Consumption Function App (
 
 For customer deployments with route tables in multiple resource groups, treat Network Contributor on every resource group listed in `routeTableNames` as mandatory for first-run success.
 
-### 3a. Assign Network Contributor on additional resource groups
+#### 3a. Assign Network Contributor on additional resource groups
 
 Skip this step if all your route tables are in the deployment resource group.
 
@@ -247,7 +226,7 @@ done
 
 > **Important:** RBAC assignment propagation is not immediate. Wait at least 5 minutes before the first manual trigger or validation run.
 
-### 4. Deploy function code
+#### 4. Deploy function code
 
 Still in the same Cloud Shell session:
 
@@ -265,7 +244,7 @@ az functionapp deployment source config-zip \
 
 > Takes under a minute.
 
-### 5. Verify
+#### 5. Verify
 
 ```bash
 az functionapp show --resource-group <resource-group> --name <function-app-name> --query state
@@ -274,6 +253,10 @@ az webapp log tail --resource-group <resource-group> --name <function-app-name>
 ```
 
 For a customer handoff, run one manual trigger after deployment and inspect the newest blob in the `run-logs` container. Do not treat the deployment as complete until every table in the run-log shows an empty `errors` array.
+
+---
+
+## Schedule configuration
 
 The function schedule is controlled by the app setting `M365_ROUTE_SYNC_SCHEDULE`. The default deployment value is midnight UTC daily (`0 0 0 * * *`).
 
@@ -344,6 +327,12 @@ Quick checks after each run:
 - Verify RBAC: `az role assignment list --assignee <principal-id> --query "[].{Role:roleDefinitionName, Scope:scope}" -o table`
 - The function identity needs Network Contributor on the RG and Storage Blob Data Contributor on the storage account (Bicep assigns these automatically).
 
+**Invalid route table name when using `resourcegroup/tablename`**
+- Pull the latest repo version. Older template behavior could try to create a route table from the raw `routeTableNames` entry, which fails when the value includes `/`.
+- Use `resourcegroup/tablename` for cross-resource-group tables; this is the expected format for runtime management.
+- If deploying manually, pre-create every route table listed in `routeTableNames` before running Bicep.
+- If deployment still fails at role assignments, this is an RBAC permission issue (not a route-table-name issue). Have an Owner or User Access Administrator run the Bicep deployment, or pre-create the required role assignments.
+
 **Managed identity deleted or role assignments missing**
 - If the Function App is re-created or its managed identity is deleted (e.g. by an Azure Policy cleanup job), the role assignments are orphaned and must be re-applied. Re-run the Bicep deployment — it will create a new identity and re-assign roles within the deployment resource group. Then re-run the cross-RG assignments from Step 3a for any additional resource groups. Orphaned assignments show up as `Unknown` principals in IAM and can be safely deleted.
 
@@ -359,6 +348,25 @@ Quick checks after each run:
 
 **Will the function remove my custom/non-M365 routes?**
 - No. The function only manages routes whose address prefixes appear in the M365 endpoint API. Any route you add manually (e.g. `0.0.0.0/0` pointing to a firewall) is invisible to the function and will never be modified or removed. The one exception: if a CIDR you added manually happens to match an M365-published prefix that Microsoft later drops, the function would remove it as part of normal M365 cleanup.
+
+---
+
+## Customer onboarding
+
+Use one Function App deployment per customer subscription.
+
+- Keep each customer isolated to one subscription and one Function App.
+- Use `ROUTE_TABLE_NAMES` only for route tables in that same subscription.
+- For tables in other resource groups, grant the Function App managed identity `Network Contributor` on each resource group.
+- Let customers update only operational app settings (for example `M365_ROUTE_SYNC_SCHEDULE` and `ROUTE_TABLE_NAMES`) in the portal.
+- Keep the customer parameters file in source control and update it after any portal-only change so future redeployments stay in sync.
+
+Customer handoff checklist:
+
+- Confirm route tables exist.
+- Confirm RBAC on every route-table resource group.
+- Run one manual trigger and verify the latest run-log has no table-level errors.
+- Confirm `M365_ROUTE_SYNC_SCHEDULE` is set to the agreed UTC schedule.
 
 ---
 
