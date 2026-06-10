@@ -87,21 +87,7 @@ See [3a. Assign Network Contributor on additional resource groups](#3a-assign-ne
 | **Storage Queue Data Contributor** | Storage Account | Supports Functions host storage interactions in Flex Consumption |
 | **Storage Table Data Contributor** | Storage Account | Supports Functions host storage interactions in Flex Consumption |
 
-To verify role assignments after deployment:
-
-```bash
-# Get the Function App's managed identity principal ID
-PRINCIPAL_ID=$(az functionapp show \
-  --resource-group <resource-group> \
-  --name <function-app-name> \
-  --query identity.principalId -o tsv)
-
-# List all role assignments for that identity
-az role assignment list \
-  --assignee $PRINCIPAL_ID \
-  --query "[].{Role:roleDefinitionName, Scope:scope}" \
-  -o table
-```
+Role assignments can be checked after infrastructure deployment in [Step 5. Verify](#5-verify).
 
 ---
 
@@ -115,12 +101,27 @@ az role assignment list \
 
 `deploy.ps1` requires a `-SubscriptionId` argument, verifies it matches `subscriptionId` in the parameters file, then sets Azure CLI context before running deployment commands.
 
+If zip deployment is enabled (default), `deploy.ps1` now fails fast when `function.zip` is missing and prints the exact build commands, instead of failing after infrastructure steps complete.
+
 ```powershell
 .\deploy.ps1 `
     -ParametersFile infra/main.testing.parameters.json `
     -ResourceGroup <resource-group> `
     -SubscriptionId <subscription-id>
 ```
+
+Required arguments:
+
+- `-ParametersFile` (required): Path to the parameters file for the target environment (for example `infra/main.testing.parameters.json` or `infra/main.prod.parameters.json`).
+- `-ResourceGroup` (required): Deployment resource group where the Function App and supporting resources are created (for example `rg-udr-m365-automation-testing`).
+- `-SubscriptionId` (required): Azure subscription ID. Must match `subscriptionId` in the parameters file.
+
+Optional arguments:
+
+- `-ZipPath`: Path to the deployment package (default: `function.zip` in the current directory).
+- `-SkipZipDeploy`: Runs infrastructure/RBAC steps only and skips code package deployment.
+
+For full parameter descriptions and examples, see [2. Configure parameters](#2-configure-parameters).
 
 ---
 
@@ -242,6 +243,8 @@ az functionapp deployment source config-zip \
   --src function.zip
 ```
 
+> **Cloud Shell note:** You may see pip dependency-resolver warnings related to preinstalled Cloud Shell packages. If the install command succeeds and `function.zip` is created, those warnings are typically non-blocking.
+
 > Takes under a minute.
 
 #### 5. Verify
@@ -250,6 +253,22 @@ az functionapp deployment source config-zip \
 az functionapp show --resource-group <resource-group> --name <function-app-name> --query state
 
 az webapp log tail --resource-group <resource-group> --name <function-app-name>
+```
+
+To verify role assignments after deployment:
+
+```bash
+# Get the Function App's managed identity principal ID
+PRINCIPAL_ID=$(az functionapp show \
+  --resource-group <resource-group> \
+  --name <function-app-name> \
+  --query identity.principalId -o tsv)
+
+# List all role assignments for that identity
+az role assignment list \
+  --assignee $PRINCIPAL_ID \
+  --query "[].{Role:roleDefinitionName, Scope:scope}" \
+  -o table
 ```
 
 For a customer handoff, run one manual trigger after deployment and inspect the newest blob in the `run-logs` container. Do not treat the deployment as complete until every table in the run-log shows an empty `errors` array.
@@ -275,7 +294,15 @@ az rest --method post \
   --uri "https://management.azure.com/subscriptions/<subscription-id>/resourceGroups/<resource-group>/providers/Microsoft.Web/sites/<function-app-name>/hostruntime/admin/functions/update_m365_routes/trigger?api-version=2024-04-01"
 ```
 
-**From the Azure Portal:** Open the Function App → Functions → `update_m365_routes` → Code + Test → Test/Run.
+**From the Azure Portal:**
+
+1. Open your Function App in the Azure Portal and select the function name (`update_m365_routes`).
+
+![Select function name in Azure Portal](image/functionname.png)
+
+2. Open **Code + Test** and click **Test/Run**.
+
+![Click Test/Run in Code + Test](image/testrun.png)
 
 ---
 
@@ -326,6 +353,11 @@ Quick checks after each run:
 **Authentication error / routes not updating**
 - Verify RBAC: `az role assignment list --assignee <principal-id> --query "[].{Role:roleDefinitionName, Scope:scope}" -o table`
 - The function identity needs Network Contributor on the RG and Storage Blob Data Contributor on the storage account (Bicep assigns these automatically).
+
+**`RoleAssignmentUpdateNotPermitted` during Bicep deployment**
+- This usually indicates a stale/orphaned role assignment from an older Function App managed identity.
+- Delete stale Function-App-related assignments for the old/deleted identity at the deployment resource group scope (`Network Contributor`) and storage account scope (`Storage Blob/Queue/Table Data Contributor`), then rerun the infrastructure deployment.
+- After infrastructure succeeds, run the zip deployment step again.
 
 **Invalid route table name when using `resourcegroup/tablename`**
 - Pull the latest repo version. Older template behavior could try to create a route table from the raw `routeTableNames` entry, which fails when the value includes `/`.
