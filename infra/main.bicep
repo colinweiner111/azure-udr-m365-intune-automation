@@ -32,6 +32,12 @@ param m365Categories string = 'Optimize,Allow'
 @description('NCRONTAB schedule for the timer trigger in UTC (six fields: sec min hour day month day-of-week).')
 param m365RouteSyncSchedule string = '0 0 0 * * *'
 
+@description('Route tables to manage for Intune routes. Same format as routeTableNames. Defaults to the same tables as routeTableNames.')
+param intuneRouteTableNames string = ''
+
+@description('NCRONTAB schedule for the Intune timer trigger in UTC. Offset from M365 schedule to avoid overlap.')
+param intuneRouteSyncSchedule string = '0 30 0 * * *'
+
 // Application Insights
 resource appInsights 'Microsoft.Insights/components@2020-02-02' = {
   name: '${functionAppName}-insights'
@@ -126,6 +132,7 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
       scaleAndConcurrency: {
         alwaysReady: [
           { name: 'function:update_m365_routes', instanceCount: 1 }
+          { name: 'function:update_intune_routes', instanceCount: 1 }
         ]
         instanceMemoryMB: 2048
         maximumInstanceCount: 40
@@ -159,6 +166,8 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
         { name: 'M365_CLIENT_REQUEST_ID', value: '' }
         { name: 'M365_CATEGORIES', value: m365Categories }
         { name: 'M365_ROUTE_SYNC_SCHEDULE', value: m365RouteSyncSchedule }
+        { name: 'INTUNE_ROUTE_TABLE_NAMES', value: !empty(intuneRouteTableNames) ? intuneRouteTableNames : routeTableNames }
+        { name: 'INTUNE_ROUTE_SYNC_SCHEDULE', value: intuneRouteSyncSchedule }
       ]
     }
   }

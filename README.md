@@ -4,6 +4,10 @@ Keeps Azure Route Tables synchronized with Microsoft 365 IP ranges so M365 traff
 
 **How it works:** An Azure Function fetches the [M365 endpoint API](https://learn.microsoft.com/en-us/microsoft-365/enterprise/microsoft-365-ip-web-service) daily, diffs the results against saved state, and adds/removes UDRs in your route tables. It also detects and restores routes that were manually deleted (drift detection). All runs are logged as JSON blobs in Azure Storage for audit.
 
+The same Function App includes a second timer (`update_intune_routes`) that does the same for Intune traffic, using a hardcoded IPv4 CIDR list sourced from Microsoft's [Intune consolidated endpoint list](https://learn.microsoft.com/en-us/mem/intune/fundamentals/intune-endpoints). The list is maintained in `shared/intune_api.py` and includes a `LAST_VERIFIED` date and source commit reference. A daily doc-version check (built into the Intune sync run) monitors the Microsoft docs repo for changes and logs a warning if an update is detected, prompting a list review and redeploy.
+
+> **Intune FQDN limitation:** UDRs route by IP only. Intune endpoints such as `*.manage.microsoft.com` and `*.dm.microsoft.com` are FQDN-only and have no IP representation — they are not covered by UDRs. Configure Zscaler bypass (passthrough, not inspection) rules for those FQDNs separately. Together, UDRs for IPs and Zscaler bypass for FQDNs provide complete Intune traffic breakout.
+
 > **When NOT to use this:** If your security appliance supports FQDN/URL-based filtering (e.g., Zscaler URL policies), that is the preferred Microsoft approach. Use UDR-based routing only when IP-based routing is required.
 
 ---
@@ -22,6 +26,7 @@ Keeps Azure Route Tables synchronized with Microsoft 365 IP ranges so M365 traff
   - [3a. Assign Network Contributor on additional resource groups](#3a-assign-network-contributor-on-additional-resource-groups)
   - [4. Deploy function code](#4-deploy-function-code)
   - [5. Verify](#5-verify)
+- [Upgrading an existing M365-only deployment](#upgrading-an-existing-m365-only-deployment)
 - [Schedule configuration](#schedule-configuration)
 - [Trigger manually](#trigger-manually)
 - [Run logs](#run-logs)
@@ -33,6 +38,8 @@ Keeps Azure Route Tables synchronized with Microsoft 365 IP ranges so M365 traff
 ---
 
 ## Why these routes?
+
+### M365
 
 Microsoft classifies M365 network traffic into [three categories](https://learn.microsoft.com/en-us/microsoft-365/enterprise/microsoft-365-network-connectivity-principles#new-office-365-endpoint-categories). This function defaults to `Optimize` + `Allow`:
 
@@ -47,6 +54,14 @@ The full list of IPs per category is published at [Microsoft 365 URLs and IP add
 **Why not `Default`?** It is too broad and would bypass too much inspection. `Optimize` + `Allow` is the targeted set (about 34 routes, subject to change as Microsoft updates endpoints).
 
 **Why UDRs?** With a [forced tunnel](https://learn.microsoft.com/en-us/azure/vpn-gateway/vpn-gateway-forced-tunneling-rm), M365 can hairpin through your NVA/VPN and add latency. UDRs with `nextHopType: Internet` provide local breakout only for those M365 CIDRs.
+
+### Intune
+
+The Intune IP list comes from the **"IP Subnets"** block in the [Intune consolidated endpoint list](https://learn.microsoft.com/en-us/mem/intune/fundamentals/intune-endpoints) (IPv4 only — IPv6 entries are excluded as Azure UDRs do not support IPv6 prefixes). The list covers the backend infrastructure Intune-enrolled devices communicate with: device management services, Windows Update for Business, Microsoft Defender for Endpoint, and related Microsoft cloud services.
+
+**Why not Azure Service Tags?** The `MicrosoftIntune` and `AzureFrontDoor.MicrosoftSecurity` Service Tags return only a small subset of the documented Intune IPs (4 CIDRs in testing vs. 85 in the consolidated list). Using them would leave most Intune traffic routing through the NVA rather than breaking out directly, defeating the purpose.
+
+**How the list stays current:** Microsoft does not publish a programmatic API for Intune IPs equivalent to the M365 endpoint service. Instead, the daily Intune sync fetches the raw `endpoints.md` file from the public [MicrosoftDocs/memdocs](https://github.com/MicrosoftDocs/memdocs) GitHub repo, compares its commit SHA against the last-known SHA stored in blob storage, and when a change is detected automatically re-parses all IPv4 CIDRs and writes the updated list to blob — no redeploy needed. If parsing fails (e.g. Microsoft restructures the page), the function falls back to the last successfully stored list, then to a hardcoded baseline in `shared/intune_api.py` as a last resort, and logs a warning in Application Insights.
 
 ---
 
@@ -178,10 +193,12 @@ For customer deployments, copy `infra/main.customer.parameters.template.json` to
 | `containerName` | Blob container for route state | Default: `m365-routes` |
 | `m365Categories` | M365 categories to include: `Optimize`, `Allow`, `Default` | Default: `Optimize,Allow` |
 | `m365RouteSyncSchedule` | Timer schedule in UTC (NCRONTAB, 6 fields: `sec min hour day month day-of-week`) | Default: `0 0 0 * * *` |
+| `intuneRouteTableNames` | Route tables to manage for Intune routes. Same format as `routeTableNames`. | Default: same as `routeTableNames` |
+| `intuneRouteSyncSchedule` | Timer schedule for Intune sync in UTC (NCRONTAB, 6 fields). Offset from M365 to avoid overlap. | Default: `0 30 0 * * *` |
 
-> **Parameter -> app setting mapping:** The Bicep deployment parameters map to Function App environment variables as follows: `routeTableNames` -> `ROUTE_TABLE_NAMES`, `containerName` -> `CONTAINER_NAME`, `m365Categories` -> `M365_CATEGORIES`, `m365RouteSyncSchedule` -> `M365_ROUTE_SYNC_SCHEDULE`.
+> **Parameter -> app setting mapping:** The Bicep deployment parameters map to Function App environment variables as follows: `routeTableNames` -> `ROUTE_TABLE_NAMES`, `containerName` -> `CONTAINER_NAME`, `m365Categories` -> `M365_CATEGORIES`, `m365RouteSyncSchedule` -> `M365_ROUTE_SYNC_SCHEDULE`, `intuneRouteTableNames` -> `INTUNE_ROUTE_TABLE_NAMES`, `intuneRouteSyncSchedule` -> `INTUNE_ROUTE_SYNC_SCHEDULE`.
 
-> **Route table limit:** Azure caps each route table at ~400 routes. `Optimize,Allow` is typically around ~34 routes, well within limits.
+> **Route table limit:** Azure caps each route table at 400 routes. M365 `Optimize,Allow` is typically ~34 routes; Intune adds ~85. Combined that's ~119 per table when both functions manage the same tables — well within the limit.
 
 #### 3. Provision infrastructure
 
@@ -275,11 +292,87 @@ For a customer handoff, run one manual trigger after deployment and inspect the 
 
 ---
 
+## Upgrading an existing M365-only deployment
+
+If your Function App already runs `update_m365_routes`, adding Intune sync is an in-place upgrade — no new infrastructure required. The existing M365 function, state, and run logs are unaffected.
+
+### Before you start
+
+Verify the managed identity has **Network Contributor** on every resource group that contains an Intune target route table. If your Intune route tables are in different resource groups than your M365 ones, add the role assignment now:
+
+```bash
+PRINCIPAL_ID=$(az functionapp show \
+  --resource-group <resource-group> \
+  --name <function-app-name> \
+  --query identity.principalId -o tsv)
+
+az role assignment create \
+  --assignee-object-id $PRINCIPAL_ID \
+  --assignee-principal-type ServicePrincipal \
+  --role "Network Contributor" \
+  --scope "/subscriptions/<subscription-id>/resourceGroups/<intune-route-table-rg>"
+```
+
+> Wait at least 5 minutes after assigning the role before triggering the first Intune seed run.
+
+### Safe upgrade sequence
+
+**1. Deploy updated code**
+
+```bash
+pip install --target .python_packages/lib/site-packages -r requirements.txt --platform manylinux2014_x86_64 --only-binary=:all:
+zip -r function.zip . -x "*.git*" "local.settings.json" "__pycache__/*" "*.pyc" "tests.py" "infra/*"
+
+az functionapp deployment source config-zip \
+  --resource-group <resource-group> \
+  --name <function-app-name> \
+  --src function.zip
+```
+
+**2. Verify both functions appear**
+
+In the Azure Portal, open the Function App and confirm both `update_m365_routes` and `update_intune_routes` are listed under Functions. The M365 function will continue running on its existing schedule without interruption.
+
+**3. Add Intune app settings**
+
+In the portal: Function App → Settings → Environment variables → add:
+
+| Setting | Value |
+|---------|-------|
+| `INTUNE_ROUTE_TABLE_NAMES` | Comma-separated list of route tables to manage for Intune. Same `rg/tablename` format as `ROUTE_TABLE_NAMES`. Can be the same tables or different ones. |
+| `INTUNE_ROUTE_SYNC_SCHEDULE` | NCRONTAB schedule (6 fields). Recommend `0 30 0 * * *` (12:30 AM UTC) to avoid overlap with M365. |
+
+Save and restart the Function App after adding the settings.
+
+**4. Run the first Intune seed manually**
+
+Trigger `update_intune_routes` from the portal or CLI (see [Trigger manually](#trigger-manually)). The first run seeds all Intune routes (~85 per table). With the batch PUT implementation this completes in under 10 seconds for 6 tables.
+
+**5. Confirm success**
+
+Check the newest `intune/` blob in the `run-logs` container and verify:
+
+- `result` is `success`
+- `add_succeeded` equals `total_routes × number_of_tables`
+- `add_failed` is `0`
+- every table under `tables` has an empty `errors` array
+
+The deployment is complete once all tables confirm clean.
+
+---
+
 ## Schedule configuration
 
-The function schedule is controlled by the app setting `M365_ROUTE_SYNC_SCHEDULE`. The default deployment value is midnight UTC daily (`0 0 0 * * *`).
+Schedules are controlled by app settings. Defaults:
 
-To change run time without redeploying code: Function App -> Settings -> Environment variables -> update `M365_ROUTE_SYNC_SCHEDULE` -> Save -> Restart.
+| App setting | Default | Function |
+|---|---|---|
+| `M365_ROUTE_SYNC_SCHEDULE` | `0 0 0 * * *` (midnight UTC) | `update_m365_routes` |
+| `INTUNE_ROUTE_SYNC_SCHEDULE` | `0 30 0 * * *` (12:30 AM UTC) | `update_intune_routes` |
+
+The Intune schedule is offset by 30 minutes to avoid overlapping ARM API calls with the M365 sync.
+
+To change a run time without redeploying code: Function App -> Settings -> Environment variables -> update the relevant setting -> Save -> Restart.
 
 ![Function App environment variables example](image/envvars.png)
 
@@ -290,13 +383,20 @@ To change run time without redeploying code: Function App -> Settings -> Environ
 **From the CLI:**
 
 ```bash
+# M365 routes
 az rest --method post \
   --uri "https://management.azure.com/subscriptions/<subscription-id>/resourceGroups/<resource-group>/providers/Microsoft.Web/sites/<function-app-name>/hostruntime/admin/functions/update_m365_routes/trigger?api-version=2024-04-01"
+
+# Intune routes
+az rest --method post \
+  --uri "https://management.azure.com/subscriptions/<subscription-id>/resourceGroups/<resource-group>/providers/Microsoft.Web/sites/<function-app-name>/hostruntime/admin/functions/update_intune_routes/trigger?api-version=2024-04-01"
 ```
+
+> **First-run note (Intune):** The initial Intune seed run adds ~85 routes per table in parallel across all configured tables. Expect it to take 2–3 minutes. After the first successful run, daily executions complete in seconds (no-change result). Check the `intune/` prefix in the `run-logs` container for a `result: "success"` log to confirm the seed completed.
 
 **From the Azure Portal:**
 
-1. Open your Function App in the Azure Portal and select the function name (`update_m365_routes`).
+1. Open your Function App in the Azure Portal and select the function name (`update_m365_routes` or `update_intune_routes`).
 
 ![Select function name in Azure Portal](image/functionname.png)
 
@@ -308,7 +408,9 @@ az rest --method post \
 
 ## Run logs
 
-Each run writes a JSON blob to the `run-logs` container in your storage account, organized by date (`YYYY/MM/DD/HH-MM-SS.json`). Browse them in Azure Storage Explorer or the portal.
+Each run writes a JSON blob to the `run-logs` container in your storage account, organized by service and date (`m365/YYYY/MM/DD/HH-MM-SS.json` for M365, `intune/YYYY/MM/DD/HH-MM-SS.json` for Intune). Browse them in Azure Storage Explorer or the portal.
+
+![run-logs container showing intune and m365 folders](image/runlogs.png)
 
 Current log shape keeps summary counters at the top level and route-level details per table under `tables`.
 
@@ -316,7 +418,7 @@ Current log shape keeps summary counters at the top level and route-level detail
 {
   "timestamp": "2026-04-23T01:03:20Z",
   "result": "success",
-  "m365_version": "2026033100",
+  "source_version": "2026033100",
   "total_routes": 34,
   "add_succeeded": 1,
   "add_failed": 0,
@@ -379,7 +481,10 @@ Quick checks after each run:
 - Policies with a `Modify` effect can overwrite route table properties. Exempt the resource group from those policies. The function will restore any removed routes on the next run (daily or manual trigger).
 
 **Will the function remove my custom/non-M365 routes?**
-- No. The function only manages routes whose address prefixes appear in the M365 endpoint API. Any route you add manually (e.g. `0.0.0.0/0` pointing to a firewall) is invisible to the function and will never be modified or removed. The one exception: if a CIDR you added manually happens to match an M365-published prefix that Microsoft later drops, the function would remove it as part of normal M365 cleanup.
+- No. The function only manages routes whose address prefixes appear in its source list (M365 API or Intune hardcoded list). Any route you add manually (e.g. `0.0.0.0/0` pointing to a firewall) is invisible to the function and will never be modified or removed. The one exception: if a CIDR you added manually happens to match a prefix that Microsoft later drops from their published list, the function would remove it as part of normal cleanup.
+
+**How does the Intune IP list stay current when Microsoft updates their endpoints?**
+- Automatically. Each daily Intune sync checks the commit SHA of `endpoints.md` in the MicrosoftDocs/memdocs GitHub repo. If it changed, the function fetches the raw file, parses the IPv4 CIDRs, stores the updated list in blob storage (`m365-routes/doc-version/intune_cidrs.json`), and uses the new list immediately — no redeploy needed. Check Application Insights logs after a run to confirm: look for "Intune CIDR list auto-updated" with the before/after commit SHAs and the new CIDR count. If you see a warning about parse failure, it means Microsoft restructured the page in a way the regex could not handle — in that case, update `shared/intune_api.py` manually and redeploy to restore the hardcoded fallback.
 
 ---
 
@@ -390,15 +495,15 @@ Use one Function App deployment per customer subscription.
 - Keep each customer isolated to one subscription and one Function App.
 - Use `ROUTE_TABLE_NAMES` only for route tables in that same subscription.
 - For tables in other resource groups, grant the Function App managed identity `Network Contributor` on each resource group.
-- Let customers update only operational app settings (for example `M365_ROUTE_SYNC_SCHEDULE` and `ROUTE_TABLE_NAMES`) in the portal.
+- Let customers update only operational app settings (for example `M365_ROUTE_SYNC_SCHEDULE`, `INTUNE_ROUTE_SYNC_SCHEDULE`, and `ROUTE_TABLE_NAMES`) in the portal.
 - Keep the customer parameters file in source control and update it after any portal-only change so future redeployments stay in sync.
 
 Customer handoff checklist:
 
-- Confirm route tables exist.
-- Confirm RBAC on every route-table resource group.
-- Run one manual trigger and verify the latest run-log has no table-level errors.
-- Confirm `M365_ROUTE_SYNC_SCHEDULE` is set to the agreed UTC schedule.
+- Confirm route tables exist and RBAC is assigned on every route-table resource group.
+- Trigger `update_m365_routes` manually and verify the latest `m365/` run-log has no table-level errors.
+- Trigger `update_intune_routes` manually. The first run is the initial seed (~2–3 minutes). Confirm the `intune/` run-log shows `result: "success"` and all tables have 0 errors before considering the deployment complete.
+- Confirm `M365_ROUTE_SYNC_SCHEDULE` and `INTUNE_ROUTE_SYNC_SCHEDULE` are set to the agreed UTC schedules.
 
 ---
 
@@ -408,6 +513,7 @@ Customer handoff checklist:
 - [M365 Endpoint Categories (Optimize / Allow / Default)](https://learn.microsoft.com/en-us/microsoft-365/enterprise/microsoft-365-network-connectivity-principles#identify-microsoft-365-network-traffic)
 - [M365 Endpoints API — worldwide endpoints](https://endpoints.office.com/endpoints/worldwide?clientrequestid=b10c5ed1-bad1-445f-b386-b919946339a7) *(live JSON the function pulls)*
 - [M365 Endpoints API — current version](https://endpoints.office.com/version/worldwide?clientrequestid=b10c5ed1-bad1-445f-b386-b919946339a7) *(version number used in run logs)*
+- [Intune network endpoints (consolidated endpoint list)](https://learn.microsoft.com/en-us/mem/intune/fundamentals/intune-endpoints)
 - [Azure Route Tables](https://learn.microsoft.com/en-us/azure/virtual-network/manage-route-table)
 - [Azure Functions Python Developer Guide](https://learn.microsoft.com/en-us/azure/azure-functions/functions-reference-python)
 

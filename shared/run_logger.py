@@ -15,15 +15,16 @@ LOG_CONTAINER = "run-logs"
 class RunLogger:
     """Writes a JSON log entry per function run to blob storage for user review."""
 
-    def __init__(self, storage_account_name: str):
+    def __init__(self, storage_account_name: str, service_name: str = "m365"):
         account_url = f"https://{storage_account_name}.blob.core.windows.net"
         credential = DefaultAzureCredential()
         self.container_client = ContainerClient(account_url, LOG_CONTAINER, credential)
+        self.service_name = service_name
 
     def write(
         self,
         *,
-        m365_version: Optional[int],
+        source_version: Optional[str],
         total_routes: int,
         added: List[str],
         removed: List[str],
@@ -34,16 +35,21 @@ class RunLogger:
         remove_failed: int,
         result: str,
         table_details: Optional[Dict[str, Any]] = None,
-        error: Optional[str] = None
+        error: Optional[str] = None,
+        duration_seconds: Optional[int] = None,
     ) -> None:
         now = datetime.now(timezone.utc)
-        blob_name = now.strftime("%Y/%m/%d/%H-%M-%S") + ".json"
+        blob_name = f"{self.service_name}/" + now.strftime("%Y/%m/%d/%H-%M-%S") + ".json"
 
         entry = {
             "timestamp": now.isoformat().replace("+00:00", "Z"),
+            "duration_seconds": duration_seconds,
             "result": result,
-            "m365_version": m365_version,
+            "source_version": source_version,
             "total_routes": total_routes,
+            "added": added,
+            "removed": removed,
+            "drift_restored": drift_restored,
             "add_succeeded": add_succeeded,
             "add_failed": add_failed,
             "remove_succeeded": remove_succeeded,

@@ -28,6 +28,9 @@
     },
     "m365Categories": {
       "value": "Optimize,Allow"
+    },
+    "intuneRouteSyncSchedule": {
+      "value": "0 30 0 * * *"
     }
   }
 }
